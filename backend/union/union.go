@@ -247,141 +247,6 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return wo.(*Object), err
 }
 
-// Move src to this remote using server-side move operations.
-//
-// This is stored with the remote path given
-//
-// It returns the destination Object and a possible error
-//
-// Will only be called if src.Fs().Name() == f.Name()
-//
-// If it isn't possible then return fs.ErrorCantMove
-func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
-	o, ok := src.(*Object)
-	if !ok {
-		fs.Debugf(src, "Can't move - not same remote type")
-		return nil, fs.ErrorCantMove
-	}
-	entries, err := f.actionEntries(o.candidates()...)
-	if err != nil {
-		return nil, err
-	}
-	for _, e := range entries {
-		if !operations.CanServerSideMove(e.UpstreamFs()) {
-			return nil, fs.ErrorCantMove
-		}
-	}
-	objs := make([]*upstream.Object, len(entries))
-	errs := Errors(make([]error, len(entries)))
-	multithread(len(entries), func(i int) {
-		su := entries[i].UpstreamFs()
-		o, ok := entries[i].(*upstream.Object)
-		if !ok {
-			errs[i] = fmt.Errorf("%s: %w", su.Name(), fs.ErrorNotAFile)
-			return
-		}
-		var du *upstream.Fs
-		for _, u := range f.upstreams {
-			if operations.Same(u.RootFs, su.RootFs) {
-				du = u
-			}
-		}
-		if du == nil {
-			errs[i] = fmt.Errorf("%s: %s: %w", su.Name(), remote, fs.ErrorCantMove)
-			return
-		}
-		srcObj := o.UnWrap()
-		duFeatures := du.Features()
-		do := duFeatures.Move
-		if duFeatures.Move == nil {
-			do = duFeatures.Copy
-		}
-		// Do the Move or Copy
-		dstObj, err := do(ctx, srcObj, remote)
-		if err != nil {
-			errs[i] = fmt.Errorf("%s: %w", su.Name(), err)
-			return
-		}
-		if dstObj == nil {
-			errs[i] = fmt.Errorf("%s: destination object not found", su.Name())
-			return
-		}
-		objs[i] = du.WrapObject(dstObj)
-		// Delete the source object if Copy
-		if duFeatures.Move == nil {
-			err = srcObj.Remove(ctx)
-			if err != nil {
-				errs[i] = fmt.Errorf("%s: %w", su.Name(), err)
-				return
-			}
-		}
-	})
-	var en []upstream.Entry
-	for _, o := range objs {
-		if o != nil {
-			en = append(en, o)
-		}
-	}
-	e, err := f.wrapEntries(en...)
-	if err != nil {
-		return nil, err
-	}
-	return e.(*Object), errs.Err()
-}
-
-// DirMove moves src, srcRemote to this remote at dstRemote
-// using server-side move operations.
-//
-// Will only be called if src.Fs().Name() == f.Name()
-//
-// If it isn't possible then return fs.ErrorCantDirMove
-//
-// If destination exists then return fs.ErrorDirExists
-func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
-	sfs, ok := src.(*Fs)
-	if !ok {
-		fs.Debugf(src, "Can't move directory - not same remote type")
-		return fs.ErrorCantDirMove
-	}
-	upstreams, err := sfs.action(ctx, srcRemote)
-	if err != nil {
-		return err
-	}
-	for _, u := range upstreams {
-		if u.Features().DirMove == nil {
-			return fs.ErrorCantDirMove
-		}
-	}
-	errs := Errors(make([]error, len(upstreams)))
-	multithread(len(upstreams), func(i int) {
-		su := upstreams[i]
-		var du *upstream.Fs
-		for _, u := range f.upstreams {
-			if operations.Same(u.RootFs, su.RootFs) {
-				du = u
-			}
-		}
-		if du == nil {
-			errs[i] = fmt.Errorf("%s: %s: %w", su.Name(), su.Root(), fs.ErrorCantDirMove)
-			return
-		}
-		err := du.Features().DirMove(ctx, su.Fs, srcRemote, dstRemote)
-		if err != nil {
-			errs[i] = fmt.Errorf("%s: %w", du.Name()+":"+du.Root(), err)
-		}
-	})
-	errs = errs.FilterNil()
-	if len(errs) == 0 {
-		return nil
-	}
-	for _, e := range errs {
-		if !errors.Is(e, fs.ErrorDirExists) {
-			return errs
-		}
-	}
-	return fs.ErrorDirExists
-}
-
 // ChangeNotify calls the passed function with a path
 // that has had changes. If the implementation
 // uses polling, it should adhere to the given interval.
@@ -888,17 +753,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		WriteMetadata:           true,
 		UserMetadata:            true,
 	}).Fill(ctx, f)
-	canMove := true
-	for _, f := range upstreams {
-		features = features.Mask(ctx, f) // Mask all upstream fs
-		if !operations.CanServerSideMove(f) {
-			canMove = false
-		}
-	}
-	// We can move if all remotes support Move or Copy
-	if canMove {
-		features.Move = f.Move
-	}
 
 	// Enable ListR when upstreams either support ListR or is local
 	// But not when all upstreams are local
@@ -952,8 +806,6 @@ var (
 	_ fs.Purger          = (*Fs)(nil)
 	_ fs.PutStreamer     = (*Fs)(nil)
 	_ fs.Copier          = (*Fs)(nil)
-	_ fs.Mover           = (*Fs)(nil)
-	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ fs.ChangeNotifier  = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
